@@ -14,11 +14,18 @@ class TelegramApi:
         self.timeout_seconds = timeout_seconds
 
     async def get_updates(self, offset: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        await self.delete_webhook()
         payload: dict[str, Any] = {"limit": limit, "timeout": 0}
         if offset is not None:
             payload["offset"] = offset
         result = await self._request("getUpdates", payload)
         return result or []
+
+    async def delete_webhook(self) -> None:
+        await self._request(
+            "deleteWebhook",
+            {"drop_pending_updates": False},
+        )
 
     async def send_message(self, chat_id: int, text: str) -> None:
         await self._request(
@@ -40,4 +47,3 @@ class TelegramApi:
                 logger.warning("Telegram API error on %s: %s", method, data)
                 return None
             return data.get("result")
-
