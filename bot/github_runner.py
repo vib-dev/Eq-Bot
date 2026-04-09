@@ -32,7 +32,9 @@ class GitHubActionsRunner:
 
     async def process_updates(self) -> None:
         offset = await self.service.db.get_telegram_offset()
+        logger.info("Fetching Telegram updates with offset=%s", offset)
         updates = await self.telegram.get_updates(offset=offset)
+        logger.info("Received %s Telegram updates", len(updates))
         if not updates:
             return
         max_update_id = offset or 0
@@ -45,6 +47,7 @@ class GitHubActionsRunner:
             chat_id = chat.get("id")
             if not chat_id or not text.startswith("/"):
                 continue
+            logger.info("Processing command %s for chat_id=%s", text, chat_id)
             await self.service.db.upsert_telegram_user(chat_id, user.get("username"), user.get("first_name"))
             await self.handle_command(chat_id, text)
         await self.service.db.set_telegram_offset(max_update_id)
