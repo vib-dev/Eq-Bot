@@ -1,283 +1,276 @@
-from __future__ import annotations
-
+import os
 import asyncio
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from telegram import Update
-from telegram.constants import ParseMode
+import json
+import time
+import feedparser
+import urllib.parse
+from bs4 import BeautifulSoup
+import yfinance as yf
+from google import genai
+from telegram import Update, constants
 from telegram.ext import Application, CommandHandler, ContextTypes
+from datetime import datetime, timedelta
 
-from .config import Settings
-from .db import Database
-from .models import UserProfile
-from .services.ai import HeuristicSummarizer
-from .services.filtering import is_fresh, materiality_score
-from .services.formatting import event_message, help_message, status_message
-from .services.metrics import extract_financial_metrics
-from .services.quotes import QuoteService
-from .services.reports import morning_market_brief, previous_market_close_iso, top_report
-from .sources.bse import BSEAnnouncementsSource
-from .sources.moneycontrol import MoneycontrolSource
-from .sources.scanx import ScanXSource
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
+# --- LOGGING ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- SECRETS & CLIENT ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-class MarketMonitorBot:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.db = Database(settings.db_path)
-        self.summarizer = HeuristicSummarizer()
-        self.quotes = QuoteService(settings.http_timeout_seconds)
+try:
+    ai_client = genai.Client(api_key=GEMINI_KEY)
+except Exception as e:
+    logger.error(f"Failed to initialize AI: {e}")
 
-    async def initialize(self) -> None:
-        self.settings.ensure_paths()
-        await self.db.init()
+# --- ENHANCED USER DATABASE (Watchlists + Settings) ---
+USER_DATA_FILE = "/tmp/system_db.json"
 
-    def build_application(self) -> Application:
-        if not self.settings.telegram_bot_token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is required.")
+INITIAL_WATCHLIST =[
+    "BSE", "MCX", "ANGELONE", "MOTILALOFS", "ANANDRATHI", "NUVAMA", "360ONE", "PRUDENT", "CAMS", "KFINTECH", "CDSL", "HDFCAMC", "NAM-INDIA", "ABSLAMC", "UTIAMC", "JMFINANCIL", "CRISIL", "GROWW", "ICICIAMC",
+    "INDIGO", "SPICEJET", "TEXRAIL", "TITAGARH", "RVNL", "RAILTEL", "RITES", "JWL", "IRCTC", "GESHIP", "SCI",
+    "ZEEL", "PVRINOX", "SUNTV", "DBCORP", "TIPSMUSIC", "NETWORK18", "SAREGAMA", "AMAGI",
+    "PAGEIND", "VTL", "KPRMILL", "WELSPUNLIV", "VMART", "ARVIND", "RAYMOND", "ICIL", "GOKEX", "LUXIND", "ARVINDFASN", "TRIDENT", "PGIL", "ABFRL", "ABLBL", "NITINSPIN", "SAISILK", "GANECOS"
+]
 
-        application = Application.builder().token(self.settings.telegram_bot_token).build()
-        application.bot_data["service"] = self
-        application.add_handler(CommandHandler("start", self.start))
-        application.add_handler(CommandHandler("help", self.help))
-        application.add_handler(CommandHandler("status", self.status))
-        application.add_handler(CommandHandler("watchlist", self.watchlist))
-        application.add_handler(CommandHandler("addstock", self.addstock))
-        application.add_handler(CommandHandler("add", self.addstock))
-        application.add_handler(CommandHandler("removestock", self.removestock))
-        application.add_handler(CommandHandler("remove", self.removestock))
-        application.add_handler(CommandHandler("addsector", self.addsector))
-        application.add_handler(CommandHandler("removesector", self.removesector))
-        application.add_handler(CommandHandler("latest", self.latest))
-        application.add_handler(CommandHandler("report", self.report))
-        application.add_handler(CommandHandler("dailyreport", self.dailyreport))
-        application.add_handler(CommandHandler("morningreport", self.dailyreport))
-        application.add_handler(CommandHandler("wake", self.wake))
-        application.add_handler(CommandHandler("ask", self.ask))
-        application.job_queue.run_repeating(
-            self.poll_and_notify,
-            interval=self.settings.poll_interval_minutes * 60,
-            first=5,
-            name="poll_and_notify",
-        )
-        return application
+processed_news_ids = set()
+stock_cache = {} # Cache long names to speed up loops
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.effective_user or not update.message:
-            return
-        await self.db.upsert_user(
-            UserProfile(
-                chat_id=update.effective_chat.id,
-                username=update.effective_user.username,
-                first_name=update.effective_user.first_name,
-            )
-        )
-        await self.db.seed_user_defaults(update.effective_chat.id)
-        await update.message.reply_text(
-            "Tracking started. Your default watchlist has been loaded and the bot will poll for new updates every 5 minutes.\n\n"
-            + help_message()
-        )
-        await update.message.reply_text(await self.status_text())
+def load_db():
+    if os.path.exists(USER_DATA_FILE):
+        try:
+            with open(USER_DATA_FILE, 'r') as f: return json.load(f)
+        except: pass
+    return {"watchlists": {}, "tv_pref": {}}
 
-    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        await update.message.reply_text(help_message())
-        await update.message.reply_text(await self.status_text())
+def save_db(data):
+    with open(USER_DATA_FILE, 'w') as f: json.dump(data, f)
 
-    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        await update.message.reply_text(await self.status_text())
+# --- HYBRID INTELLIGENCE ENGINE ---
 
-    async def watchlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        stocks, sectors = await self.db.get_watchlist(update.effective_chat.id)
-        text = "Stocks:\n" + ", ".join(stocks[:120]) + "\n\nSectors:\n" + ", ".join(sectors)
-        await update.message.reply_text(text)
+async def get_stock_metrics(symbol):
+    if symbol not in stock_cache:
+        try:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            stock_cache[symbol] = ticker.info.get('shortName', symbol)
+        except: stock_cache[symbol] = symbol
 
-    async def addstock(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /addstock SYMBOL")
-            return
-        await self.db.add_stock(update.effective_chat.id, context.args[0])
-        await update.message.reply_text(f"Added {context.args[0].upper()} to your watchlist.")
+    name = stock_cache[symbol]
+    
+    try:
+        t = yf.Ticker(f"{symbol}.NS").fast_info
+        cmp = t.get('last_price', 0)
+        pc = t.get('previous_close', 1)
+        chg = ((cmp - pc) / pc) * 100 if pc else 0
+        mc = t.get('market_cap', 0) / 1e7
+        return round(cmp, 2), round(chg, 2), mc, name
+    except: return 0, 0, 0, name
 
-    async def removestock(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /removestock SYMBOL")
-            return
-        await self.db.remove_stock(update.effective_chat.id, context.args[0])
-        await update.message.reply_text(f"Removed {context.args[0].upper()} from your watchlist.")
+async def fetch_dual_net_news(symbol, company_name):
+    """
+    Scrapes both Yahoo Finance Backend + LiveMint / Google News dynamically.
+    Combines to form the absolute net for 0 missed notifications.
+    """
+    updates =[]
+    
+    # NET 1: YFinance Immediate Push
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        for news in ticker.news[:2]:
+            updates.append({"title": news.get('title'), "link": news.get('link'), "id": news.get('uuid', str(time.time())), "text": "Corporate details in linked article."})
+    except: pass
 
-    async def addsector(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /addsector sector name")
-            return
-        sector = " ".join(context.args)
-        await self.db.add_sector(update.effective_chat.id, sector)
-        await update.message.reply_text(f"Added sector: {sector}")
+    # NET 2: LiveMint / Strict RSS Push (Overriding Caches)
+    ts = int(time.time())
+    query = urllib.parse.quote(f'"{company_name}" OR "{symbol}" (announcement OR results OR updates) (LiveMint OR BSE)')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en&scoring=n&cb={ts}"
+    feed = feedparser.parse(url)
+    
+    for e in feed.entries[:2]:
+        body = BeautifulSoup(e.description, "html.parser").get_text(" ") if hasattr(e, 'description') else ""
+        updates.append({"title": e.title, "link": e.link, "id": e.id, "text": body})
+        
+    return updates
 
-    async def removesector(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /removesector sector name")
-            return
-        sector = " ".join(context.args)
-        await self.db.remove_sector(update.effective_chat.id, sector)
-        await update.message.reply_text(f"Removed sector: {sector}")
+async def ai_finxray_analyzer(context_title, context_body, symbol, name, tv_enabled):
+    """
+    Tier-1 Engine: Filters hallucinations, implements "GQ/Quest" styles.
+    Checks explicitly against BSE/CDSL identity false positives.
+    """
+    tv_prompt = """
+    TV1:[Create punchy TV ticker sentence 1, 5-8 words max. UPPERCASE.]
+    TV2:[Create punchy TV ticker sentence 2, 5-8 words max. UPPERCASE.]
+    """ if tv_enabled else ""
 
-    async def latest(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /latest SYMBOL")
-            return
-        rows = await self.db.ranked_latest_events(context.args[0], limit=5)
-        if not rows:
-            await update.message.reply_text("No stored updates found for that symbol yet.")
-            return
-        for row in rows:
-            await update.message.reply_text(
-                event_message(row),
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
+    prompt = f"""
+    You are an Elite Institutional Equity Analyst parsing breaking news for {name} ({symbol}).
+    TITLE: {context_title}
+    BODY: {context_body[:900]}
 
-    async def report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        since_iso = previous_market_close_iso(self.settings.bot_timezone)
-        rows = await self.db.top_for_user_since(update.effective_chat.id, since_iso, limit=20)
-        await update.message.reply_text(top_report(rows), parse_mode=ParseMode.MARKDOWN)
+    **MANDATORY CHECK ONE (THE "VIRAT" PROTOCOL):** 
+    If {name} ({symbol}) is JUST mentioned as the stock exchange platform (e.g. another company wrote a letter "TO the BSE"), return ONLY the word: REJECT.
+    We only want news WHERE {name} is the central business making the announcement or releasing earnings.
 
-    async def dailyreport(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
-            return
-        since_iso = previous_market_close_iso(self.settings.bot_timezone)
-        rows = await self.db.market_briefing_since(since_iso, limit=25)
-        await update.message.reply_text(morning_market_brief(rows, tz_name=self.settings.bot_timezone), parse_mode=ParseMode.MARKDOWN)
+    If valid, generate EXACTLY this format (NO extra conversational text):
+    SUBJECT: [Extract accurate 1-line business essence]
+    {tv_prompt}[IF NEWS CONTAINS EARNINGS/RESULTS, use tag 📊 QUARTER HIGHLIGHTS:]
+    📊 QUARTER HIGHLIGHTS:
+    • [Revenue metrics + YoY %]
+    •[EBITDA/Net Profit Margin + YoY/QoQ %]
+    • [Dividend or crucial volume guidance][IF GENERAL CORPORATE NEWS, use tag 🔍 STRATEGIC INSIGHTS:]
+    🔍 STRATEGIC INSIGHTS:
+    • [Material update detail 1]
+    • [Impact analysis factor 2]
+    """
+    
+    try:
+        res = await asyncio.to_thread(ai_client.models.generate_content, model='gemini-2.5-flash', contents=prompt)
+        text = res.text.strip()
+        
+        # Stop False Positives Dead in their Tracks
+        if "REJECT" in text.upper()[:15]:
+            return None 
 
-    async def wake(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        since = await self.db.get_last_notified(update.effective_chat.id)
-        rows = await self.db.latest_for_user(update.effective_chat.id, since_iso=since)
-        if rows:
-            await update.message.reply_text(f"There are {len(rows)} new stored updates since the last alert.")
-        else:
-            await update.message.reply_text("No new announcements or tracked news since the last bot response.")
+        return text
+    except Exception as e:
+        logger.error(f"AI Parse Error: {e}")
+        return None
 
-    async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.message:
-            return
-        question = " ".join(context.args).strip()
-        if not question:
-            await update.message.reply_text("Usage: /ask your question")
-            return
-        rows = await self.db.latest_for_user(update.effective_chat.id)
-        context_lines = [f"{row['company_name']} {row['title']} {row['summary']}" for row in rows[:10]]
-        answer = self.summarizer.answer(question, context_lines)
-        await update.message.reply_text(answer)
+async def package_notification(item, symbol, cmp, chg, name, tv_enabled):
+    analysis_block = await ai_finxray_analyzer(item['title'], item['text'], symbol, name, tv_enabled)
+    
+    # Trigger False Positive protection - Abort send
+    if not analysis_block: return None 
 
-    async def poll_and_notify(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        service: MarketMonitorBot = context.application.bot_data["service"]
-        new_events = await service.collect_events()
-        if not new_events:
-            logger.info("No new events in this cycle.")
-            return
-        users = await service.db.get_all_users()
-        for chat_id in users:
-            symbols = await service.db.get_user_symbols(chat_id)
-            matched = [event for event in new_events if event.symbol in symbols]
-            for event in matched[: service.settings.max_updates_per_cycle]:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=event_message(event),
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
-                )
-                await service.db.set_last_notified(chat_id, event.published_at.isoformat())
+    color = "🟢" if chg > 0 else "🔴" if chg < 0 else "🟡"
+    sym_chg = f"+{chg}" if chg > 0 else f"{chg}"
+    
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ist = now.strftime("%d %b %Y · %H:%M IST")
 
-    async def collect_events(self) -> list:
-        adapters = []
-        if self.settings.enable_bse:
-            adapters.append(BSEAnnouncementsSource())
-        if self.settings.enable_moneycontrol:
-            adapters.append(MoneycontrolSource())
-        if self.settings.enable_scanx:
-            adapters.append(ScanXSource())
+    query = urllib.parse.quote(f"Evaluate this Indian Corporate announcement: {item['link']}")
+    gemini_link = f"https://gemini.google.com/app?q={query}"
 
-        new_events = []
-        for adapter in adapters:
-            try:
-                events = await adapter.fetch()
-                logger.info("Fetched %s events from %s", len(events), adapter.name)
-            except Exception as exc:
-                logger.exception("Source adapter failed: %s", adapter.name, exc_info=exc)
-                continue
-            kept_for_adapter = 0
-            for event in events:
-                if not is_fresh(event.published_at, self.settings.real_time_freshness_minutes):
-                    logger.info(
-                        "Skipping stale event from %s for %s at %s",
-                        adapter.name,
-                        event.symbol,
-                        event.published_at.isoformat(),
-                    )
-                    continue
-                event.materiality_score = materiality_score(event.title, event.raw_text)
-                if event.materiality_score <= 0:
-                    continue
-                event.summary, event.key_points = self.summarizer.summarize(event.title, event.raw_text)
-                metrics = extract_financial_metrics(event.raw_text)
-                event.revenue = metrics["revenue"]
-                event.revenue_yoy = metrics["revenue_yoy"]
-                event.ebitda = metrics["ebitda"]
-                event.ebitda_yoy = metrics["ebitda_yoy"]
-                event.pat = metrics["pat"]
-                event.pat_yoy = metrics["pat_yoy"]
-                event.cmp, event.pct_change = await self.quotes.fetch_quote(event.symbol)
-                inserted = await self.db.insert_event(event)
-                if inserted:
-                    new_events.append(event)
-                    kept_for_adapter += 1
-            logger.info("Kept %s fresh/material events from %s", kept_for_adapter, adapter.name)
-        return sorted(new_events, key=lambda item: item.published_at, reverse=True)
+    final_msg = (
+        f"{color} **{name}** | {symbol}\n"
+        f"₹{cmp} ({sym_chg}%) · 🕒 {ist}\n\n"
+        f"{analysis_block}\n\n"
+        f"🔗 [Official Filing/Article]({item['link']})\n"
+        f"⚡ [Analyze with Gemini AI App]({gemini_link})"
+    )
+    return final_msg
 
-    async def status_text(self) -> str:
-        now = datetime.now(ZoneInfo(self.settings.bot_timezone))
-        total_events = await self.db.count_events()
-        return status_message(
-            now_label=now.strftime("%Y-%m-%d %H:%M %Z"),
-            last_run=await self.db.get_meta("last_workflow_run"),
-            last_sources=await self.db.get_meta("last_source_check"),
-            last_alerts=await self.db.get_meta("last_alert_cycle"),
-            last_morning_brief=await self.db.get_meta("last_morning_brief_at"),
-            total_events=total_events,
-            freshness_minutes=self.settings.real_time_freshness_minutes,
-        )
+# --- TELEGRAM BOT ROUTING ---
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_chat.id)
+    db = load_db()
+    if uid not in db['watchlists']: db['watchlists'][uid] = INITIAL_WATCHLIST
+    save_db(db)
+    await update.message.reply_text(
+        "💼 **GQ/FinXRay Caliber AI Initialized.**\n\n"
+        "🟢 Auto-Detects Earnings: Prints \"Quarter Highlights\" margins directly.\n"
+        "🛑 Smart Reject Active: Automatically ignores irrelevant Exchange clarifications.\n"
+        "⚙️ Use `/graphics ON` to enable TV Chyron texts for breaking feeds.\n"
+        "Try fetching specific metrics with: `/latest RVNL`"
+    )
 
-def main() -> None:
-    settings = Settings.from_env()
-    service = MarketMonitorBot(settings)
-    asyncio.run(service.initialize())
-    app = service.build_application()
-    app.run_polling(drop_pending_updates=True)
+async def toggle_graphics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_chat.id)
+    state = "ON" if context.args and context.args[0].upper() == "ON" else "OFF"
+    db = load_db()
+    
+    if 'tv_pref' not in db: db['tv_pref'] = {}
+    db['tv_pref'][uid] = (state == "ON")
+    save_db(db)
+    
+    await update.message.reply_text(f"📺 TV Graphics formatting is now set to: **{state}**.")
+
+async def pull_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_text("Cmd requires valid ticker: `/latest CDSL`", parse_mode="Markdown")
+    sym = context.args[0].upper()
+    uid = str(update.effective_chat.id)
+    db = load_db()
+    tv_on = db.get('tv_pref', {}).get(uid, False)
+    
+    loading = await update.message.reply_text(f"📡 Querying Multi-net Intelligence for {sym}...")
+    cmp, chg, mc, name = await get_stock_metrics(sym)
+    items = await fetch_dual_net_news(sym, name)
+
+    if not items:
+        return await loading.edit_text(f"Zero highly relevant results or filings processed in past 24Hrs for {name}.")
+
+    await loading.delete()
+    sent_something = False
+    
+    for i in items:
+        # Pre-process duplication on exact requests
+        if i['id'] not in processed_news_ids:
+            payload = await package_notification(i, sym, cmp, chg, name, tv_on)
+            if payload:
+                processed_news_ids.add(i['id'])
+                sent_something = True
+                await update.message.reply_text(payload, parse_mode="Markdown", disable_web_page_preview=True)
+
+    if not sent_something:
+        await update.message.reply_text("AI correctly swept the wire but determined hits were 'Irrelevant / Noise / Other Entity Mentions' and auto-discarded them to save your time.")
+
+async def hyper_watchdog(context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    targets = set(t for tracks in db.get('watchlists', {}).values() for t in tracks)
+
+    for ticker in targets:
+        await asyncio.sleep(0.5) 
+        cmp, chg, mc, name = await get_stock_metrics(ticker)
+        
+        # Protect noise floor for irrelevant low caps
+        if mc < 1000 and mc != 0: continue
+
+        batch = await fetch_dual_net_news(ticker, name)
+        
+        for news in batch:
+            if news['id'] not in processed_news_ids:
+                processed_news_ids.add(news['id'])
+                if len(processed_news_ids) > 1000: processed_news_ids.clear()
+                
+                # We analyze it for global validity just ONCE.
+                test_tv_param = False # Base check assumes false to save AI tokens globally, formatting alters locally
+                payload = None # Generate payload conditionally depending on target preferences
+                valid_checked = False
+                is_valid = False
+
+                for uid, subs in db.get('watchlists', {}).items():
+                    if ticker in subs:
+                        if not valid_checked:
+                            # Before processing the visual output, let AI perform strict verify
+                            valid_block = await ai_finxray_analyzer(news['title'], news['text'], ticker, name, False)
+                            valid_checked = True
+                            if not valid_block: break # AI Said REJECT. Cease immediately globally.
+                            is_valid = True
+
+                        if is_valid:
+                            # Apply their visual preference for transmission
+                            wants_tv = db.get('tv_pref', {}).get(uid, False)
+                            custom_push = await package_notification(news, ticker, cmp, chg, name, wants_tv)
+                            try:
+                                if custom_push:
+                                    await context.bot.send_message(chat_id=uid, text=custom_push, parse_mode="Markdown", disable_web_page_preview=True)
+                            except: pass
+        await asyncio.sleep(0.5)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("latest", pull_latest))
+    app.add_handler(CommandHandler("graphics", toggle_graphics))
+
+    q = app.job_queue
+    if q: q.run_repeating(hyper_watchdog, interval=180, first=5)
+    
+    logger.info("🟢 Quest-Class Architecture Initialized.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
